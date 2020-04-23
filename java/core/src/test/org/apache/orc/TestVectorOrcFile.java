@@ -4005,6 +4005,115 @@ public class TestVectorOrcFile {
   }
 
   @Test
+  public void testPredicatePushdownIssue1() throws Exception {
+    TypeDescription schema = createInnerSchema();
+    Writer writer = OrcFile.createWriter(testFilePath,
+        OrcFile.writerOptions(conf)
+            .setSchema(schema)
+            .stripeSize(400000L)
+            .compress(CompressionKind.NONE)
+            .bufferSize(500)
+            .rowIndexStride(1000)
+            .version(fileFormat));
+    VectorizedRowBatch batch = schema.createRowBatch();
+    batch.ensureSize(3500);
+    batch.size = 3500;
+    for(int i=0; i < 3500; ++i) {
+      batch.cols[0].noNulls = false;
+      batch.cols[0].isNull[i] = true; // all nulls for int1
+      ((BytesColumnVector) batch.cols[1]).setVal(i,
+          Integer.toHexString(10*i).getBytes(StandardCharsets.UTF_8));
+    }
+    writer.addRowBatch(batch);
+    writer.close();
+
+    Reader reader = OrcFile.createReader(testFilePath,
+        OrcFile.readerOptions(conf).filesystem(fs));
+    assertEquals(3500, reader.getNumberOfRows());
+
+    // all values for int1 are null, so not(isNull(int1)) should always be false and not rows should be read
+    SearchArgument sarg = SearchArgumentFactory.newBuilder()
+        .startNot()
+        .isNull("int1", PredicateLeaf.Type.LONG)
+        .end()
+        .build();
+
+    RecordReader rows = reader.rows(reader.options()
+        .range(0L, Long.MAX_VALUE)
+        .searchArgument(sarg, new String[]{}));
+    batch = reader.getSchema().createRowBatch(3500);
+
+    rows.nextBatch(batch);
+    assertEquals(0, batch.size);
+  }
+
+  @Test
+  public void testPredicatePushdownIssue2() throws Exception {
+    TypeDescription schema = createInnerSchema();
+    Writer writer = OrcFile.createWriter(testFilePath,
+        OrcFile.writerOptions(conf)
+            .setSchema(schema)
+            .stripeSize(400000L)
+            .compress(CompressionKind.NONE)
+            .bufferSize(500)
+            .rowIndexStride(1000)
+            .version(fileFormat));
+    VectorizedRowBatch batch = schema.createRowBatch();
+    batch.ensureSize(3500);
+    batch.size = 3500;
+    for(int i=0; i < 3500; ++i) {
+      if (i % 2 == 0) {
+        batch.cols[0].noNulls = false;
+        batch.cols[0].isNull[i] = true; // every other value is null or 1
+        batch.cols[1].noNulls = false;
+        batch.cols[1].isNull[i] = true; // every other value is null or "val"
+      } else {
+        batch.cols[0].isNull[i] = false;
+        ((LongColumnVector) batch.cols[0]).vector[i] = 1;
+        batch.cols[1].isNull[i] = false;
+        ((BytesColumnVector) batch.cols[1]).setVal(i, "val".getBytes(StandardCharsets.UTF_8));
+      }
+    }
+    writer.addRowBatch(batch);
+    writer.close();
+    Reader reader = OrcFile.createReader(testFilePath,
+        OrcFile.readerOptions(conf).filesystem(fs));
+    assertEquals(3500, reader.getNumberOfRows());
+
+    // values for int1 are either null or 1, so not(in(int1, 1)) should always be true because null
+    // occurs every 2nd row and hence all row groups should be returned
+    SearchArgument sarg = SearchArgumentFactory.newBuilder()
+        .startNot()
+        .in("int1", PredicateLeaf.Type.LONG, 1L)
+        .end()
+        .build();
+
+    RecordReader rows = reader.rows(reader.options()
+        .range(0L, Long.MAX_VALUE)
+        .searchArgument(sarg, new String[]{}));
+    batch = reader.getSchema().createRowBatch(2500);
+
+    rows.nextBatch(batch);
+    assertEquals(3500, batch.size);
+
+    // values for string1 are either null or "val", so not(in(string1, "val")) should always be true because null
+    // occurs every 2nd row and hence all row groups should be returned
+    sarg = SearchArgumentFactory.newBuilder()
+        .startNot()
+        .in("string1", PredicateLeaf.Type.STRING, "val")
+        .end()
+        .build();
+
+    rows = reader.rows(reader.options()
+        .range(0L, Long.MAX_VALUE)
+        .searchArgument(sarg, new String[]{}));
+    batch = reader.getSchema().createRowBatch(2000);
+
+    rows.nextBatch(batch);
+    assertEquals(3500, batch.size);
+  }
+
+  @Test
   public void testColumnEncryption() throws Exception {
     Assume.assumeTrue(fileFormat != OrcFile.Version.V_0_11);
     final int ROWS = 1000;
